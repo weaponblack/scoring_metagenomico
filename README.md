@@ -129,7 +129,7 @@ python python/sequential.py -K 5000 --n_runs 5 --search_seed 42
 
 ### Registro en `results/benchmark.csv`
 Cada ejecución exitosa del pipeline de benchmark añade una fila al archivo CSV con las siguientes variables estadísticas:
-*   `implementation`: Nombre del runtime (siempre `"sequential"` en Nivel 1).
+*   `implementation`: Nombre del runtime (`"sequential"` en Nivel 1, `"multicore"` en Nivel 2).
 *   `K`: Número de candidatos evaluados.
 *   `n_samples`: Cantidad de muestras procesadas.
 *   `n_items`: Dimensión de ítems metagenómicos.
@@ -140,11 +140,44 @@ Cada ejecución exitosa del pipeline de benchmark añade una fila al archivo CSV
 *   `best_w1`, `best_w2`, `best_w3`: Pesos óptimos descubiertos.
 *   `signal_strength` / `seed`: Configuración experimental.
 *   `dtype`: Precisión de memoria utilizada (`"float32"`).
+*   `n_processes`: Número de procesos paralelos (solo en Nivel 2).
+*   `speedup`: Factor de aceleración en relación al baseline secuencial real.
+*   `efficiency`: Eficiencia paralela.
+*   `cpu_name` / `cpu_count` / `platform` / `python_version`: Metadatos del hardware y entorno de ejecución.
 
 ### Visualizaciones en `results/plots/`
-El ejecutor genera dos archivos gráficos:
+El ejecutor genera dos archivos gráficos de diagnóstico y tres de rendimiento HPC:
 1.  **`score_distribution.png`**: Histograma de las puntuaciones de muestras sanas (azul) vs. enfermas (naranja), mostrando el grado de separación logrado por el modelo optimizado.
-2.  **`roc_curve.png`**: Gráfico estándar ROC para el mejor candidato de pesos, mostrando el True Positive Rate vs. False Positive Rate.
+2.  **`roc_curve.png`**: Gráfico estándar ROC para el mejor candidato de pesos.
+3.  **`execution_time_vs_processes.png`**: Tiempo medio de ejecución en función del número de procesos CPU ($P$).
+4.  **`speedup_vs_processes.png`**: Aceleración observada en comparación con la aceleración ideal (lineal) y el ajuste de la Ley de Amdahl.
+5.  **`efficiency_vs_processes.png`**: Eficiencia paralela ($Speedup / P$) expresada como porcentaje.
+6.  **`amdahl_analysis.txt`**: Archivo de texto que detalla el análisis de escalabilidad, el valor de la fracción serial $f$, y los valores teóricos vs observados de speedup.
+
+---
+
+## Nivel 2: Multiprocesamiento (Multicore)
+
+La versión paralela distribuye los $K$ candidatos de pesos entre múltiples procesos CPU locales utilizando un `Pool` de procesos con el método `spawn`.
+
+### 1. Optimización del IPC (Initializer Pattern)
+Para evitar serializar y enviar la matriz de abundancias $A$ y los perfiles de referencia metagenómica $T, S, F$ (que pueden ser gigantescos) a cada proceso en cada iteración:
+*   Se utiliza un inicializador de Pool (`_worker_init`) que inyecta estas variables de manera global en el contexto de memoria del proceso hijo al nacer.
+*   Posteriormente, cada worker procesa un bloque de candidatos (`chunk`) local, eliminando redundancias de comunicación (IPC Overhead).
+
+### 2. Instrucciones de Ejecución (Multicore)
+Usa el script `python/multicore.py` para correr la versión paralela:
+
+**Ejecución individual con un número fijo de cores ($P$):**
+```bash
+python python/multicore.py -K 5000 -P 4 --n_runs 5 --search_seed 42
+```
+
+**Ejecución automatizada de Barrido (Sweep):**
+Corre automáticamente para $P = 1, 2, 4, 8, \text{cpu\_count()}$, calcula métricas de escalabilidad, realiza el ajuste de la Ley de Amdahl, y genera los gráficos correspondientes en `results/plots/`:
+```bash
+python python/multicore.py -K 5000 --sweep --n_runs 5 --search_seed 42
+```
 
 ---
 
@@ -153,13 +186,10 @@ El ejecutor genera dos archivos gráficos:
 El código ha sido diseñado cuidadosamente para allanar el camino de las siguientes etapas de optimización:
 
 1.  **Multiprocessing (Nivel 2 - Python)**: 
-    *   La función `evaluate_candidate` en `utils.py` está totalmente aislada de variables globales y estados mutables de clase.
-    *   La paralelización puede realizarse fácilmente mapeando un pool de procesos (`multiprocessing.Pool`) sobre los $K$ candidatos, distribuyendo la carga computacional en múltiples núcleos de CPU.
+    *   La paralelización se realiza mapeando un pool de procesos (`multiprocessing.Pool`) sobre los $K$ candidatos, distribuyendo la carga computacional en múltiples núcleos de CPU.
 2.  **C/C++ con OpenMP (Nivel 3)**:
-    *   La operación central es el cálculo del vector $P$ y el producto matriz-vector $A \cdot P$.
-    *   En C/C++, la matriz $A$ y los vectores se almacenarán de forma contigua en memoria. Un bucle paralelo `#pragma omp parallel for` acelerará drásticamente el producto matriz-vector para conjuntos masivos.
+    *   La operación central es el cálculo del vector $P$ y el producto matriz-vector $A \cdot P$. Un bucle paralelo `#pragma omp parallel for` acelerará drásticamente el producto matriz-vector para conjuntos masivos.
 3.  **MPI (Nivel 4 - Sistemas Distribuidos)**:
-    *   Para procesar millones de candidatos $K$ o dimensiones de ítems que no quepan en un solo nodo, MPI permitirá dividir el rango de candidatos o la matriz de datos entre múltiples nodos de cómputo usando llamadas `MPI_Scatter` / `MPI_Gather`.
+    *   Para procesar millones de candidatos $K$ o dimensiones de ítems que no quepan en un solo nodo, MPI permitirá dividir el rango de candidatos o la matriz de datos entre múltiples nodos de cómputo.
 4.  **CUDA (Nivel 5 - Aceleración por GPU)**:
-    *   El uso de datos en precisión simple (`float32`) es el estándar óptimo para hardware GPU.
-    *   El producto matriz-vector $A P$ y las sumas vectoriales pueden ejecutarse concurrentemente en miles de hilos de GPU usando librerías como PyCUDA, CuPy o implementando kernels CUDA directos para lograr aceleraciones masivas (superando los 100x en datasets gigantescos).
+    *   El uso de datos en precisión simple (`float32`) es el estándar óptimo para hardware GPU. El producto matriz-vector $A P$ y las sumas vectoriales pueden ejecutarse concurrentemente en miles de hilos de GPU usando librerías como PyCUDA, CuPy o implementando kernels CUDA directos para lograr aceleraciones masivas (superando los 100x en datasets gigantescos).

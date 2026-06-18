@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 results/
 implementation_plans/
+python/run_verification.py
