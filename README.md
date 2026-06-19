@@ -2,7 +2,7 @@
 
 Este proyecto de Computación de Alto Rendimiento (HPC) implementa un framework modular para la optimización de un vector de pesos metagenómico utilizado en clasificación binaria de muestras de salud (Sanas vs. Enfermas). 
 
-Esta versión corresponde al **Nivel 1**: la implementación secuencial en Python (baseline) sin paralelismo. Todo el pipeline está optimizado con tipado `float32` y diseñado de manera desacoplada para facilitar la posterior paralelización mediante Multiprocessing, OpenMP, MPI y CUDA (GPU).
+Actualmente el proyecto abarca desde el **Nivel 1** (implementación secuencial en Python) hasta el **Nivel 4** (sistemas distribuidos con MS-MPI), con aceleraciones drásticas en sistemas multinúcleo gracias a C y OpenMP (**Nivel 3**). Todo el pipeline está optimizado con tipado `float32`.
 
 ---
 
@@ -54,142 +54,78 @@ Para garantizar que el espacio de optimización sea reproducible, desafiante y e
 
 El código está organizado de manera estrictamente modular conforme a las especificaciones:
 
-```
+```text
 scoring_metagenomico/
+│
+├── C_OpenMP_MPI/
+│   ├── scoring_openmp.c       # Motor paralelo en C (Memoria Compartida - OpenMP)
+│   ├── scoring_mpi.c          # Motor distribuido en C (MS-MPI)
+│   ├── Makefile               # Script de compilación (GCC)
+│   ├── run_sweep.py           # Benchmark automatizado para OpenMP
+│   └── run_sweep_mpi.py       # Benchmark automatizado para MPI
 │
 ├── data/
 │   ├── generate_data.py       # Script CLI generador de datos sintéticos
 │   ├── matrix_A.npy           # Matriz A guardada (NumPy float32)
 │   ├── labels.npy             # Vector de etiquetas y (NumPy float32)
-│   ├── T.npy                  # Perfil taxonómico T (NumPy float32)
-│   ├── S.npy                  # Perfil ecológico S (NumPy float32)
-│   └── F.npy                  # Perfil funcional F (NumPy float32)
+│   ├── T.npy, S.npy, F.npy    # Perfiles metagenómicos (NumPy float32)
 │
 ├── python/
-│   ├── sequential.py          # Baseline secuencial (búsqueda aleatoria + benchmark)
-│   └── utils.py               # Funciones auxiliares de carga, evaluación y gráficos
+│   ├── sequential.py          # Baseline secuencial (búsqueda aleatoria)
+│   ├── multicore.py           # Nivel 2: Multiprocesamiento nativo en Python
+│   └── utils.py               # Funciones auxiliares de carga y evaluación
 │
 ├── results/
-│   ├── benchmark.csv          # Registro persistente de tiempos y métricas
-│   └── plots/                 # Directorio para curvas ROC e histogramas
+│   ├── benchmark.csv          # Registro persistente de métricas (Python)
+│   ├── openmp_benchmark.csv   # Registro persistente de métricas (OpenMP)
+│   ├── mpi_benchmark.csv      # Registro persistente de métricas (MPI)
+│   └── plots/                 # Directorio para visualizaciones
 │
+├── MANUAL_USUARIO.md          # Guía detallada de compilación y ejecución de todos los sistemas
 ├── requirements.txt           # Dependencias de Python
 └── README.md                  # Documentación del proyecto (este archivo)
 ```
 
 ---
 
-## Instrucciones de Instalación y Ejecución
+## Fases Implementadas
 
-### 1. Prerrequisitos e Instalación
-Asegúrate de tener instalado Python (versión 3.9 o superior). Instala las dependencias necesarias:
+### Nivel 1: Baseline Secuencial en Python
+Establece la precisión matemática y las estructuras de datos (NumPy `.npy`), calculando el AUC de forma determinista para probar correctitud y estableciendo los tiempos base (baseline).
 
-```bash
-pip install -r requirements.txt
-```
+### Nivel 2: Multiprocesamiento en Python (Multicore)
+La versión paralela distribuye los $K$ candidatos de pesos entre múltiples procesos locales utilizando un `multiprocessing.Pool` (con método `spawn`). Destaca por el patrón de inicialización del IPC (`_worker_init`) para compartir la matriz de datos en memoria en los procesos hijo de forma global y eliminar el enorme *overhead* de serialización por mensajes.
 
-*(Las dependencias clave son `numpy`, `scikit-learn`, `matplotlib`, `pandas`, `tqdm`)*
+### Nivel 3: Paralelismo en Memoria Compartida (C + OpenMP)
+La operación matemática se porta a **C nativo**. Cuenta con un parser propio y ligero de archivos `.npy` y un algoritmo de cálculo de ROC AUC (`O(n log n)`) optimizado sin dependencias externas. 
+Usando un bucle paralelo `#pragma omp parallel for` de grano grueso (Coarse-Grained) sobre el bucle externo de los $K$ candidatos, se elimina toda sobrecarga de sincronización de hilos, permitiendo acelerar las evaluaciones de manera lineal aprovechando la caché del procesador. Se garantiza 100% de determinismo matemático en los resultados.
 
-### 2. Paso 1: Generar el Dataset Sintético
-Usa el script `data/generate_data.py` para construir matrices escalables. 
+### Nivel 4: Sistemas Distribuidos (C + MS-MPI)
+Implementación orientada a granjas de servidores o clústeres. Los procesos rank MPI cargan independientemente el dataset desde el sistema de archivos local para no saturar la red (sin requerir gigantescos `MPI_Bcast` para matrices de memoria), y se dividen el espacio de búsqueda Dirichlet. Utilizando la primitiva `MPI_Gather` hacia el Rank 0, se aplica un desempate determinista riguroso de los mejores AUC locales obtenidos en paralelo, logrando resultados idénticos a los del modelo base secuencial pero distribuibles en múltiples nodos.
 
-**Parámetros configurables:**
-*   `--n_samples_per_class`: Cantidad de muestras sanas/enfermas (ej. 50 genera 100 muestras en total).
-*   `--n_items`: Dimensión de características $N$ (ej. 10000).
-*   `--signal_strength`: Multiplicador $\beta$ (fuerza de la firma de enfermedad).
-*   `--seed`: Semilla aleatoria de reproducibilidad.
+---
 
-**Ejemplo de ejecución (Set pequeño de prueba):**
-```bash
-python data/generate_data.py --n_samples_per_class 5 --n_items 10000 --signal_strength 0.5 --seed 42
-```
+## Instrucciones de Instalación, Compilación y Ejecución
 
-**Ejemplo de ejecución (Set grande de escalabilidad):**
-```bash
-python data/generate_data.py --n_samples_per_class 50 --n_items 50000 --signal_strength 0.4 --seed 42
-```
+Debido a que el proyecto ha evolucionado para cubrir múltiples lenguajes y arquitecturas (Python, OpenMP, y MS-MPI en Windows), hemos consolidado y movido todos los pasos exactos a un manual independiente para mantener la legibilidad:
 
-### 3. Paso 2: Ejecutar la Búsqueda Aleatoria y Benchmark Secuencial
-El script `python/sequential.py` genera $K$ candidatos de peso usando la distribución de Dirichlet, ejecuta la optimización secuencial de forma repetida para evitar ruido estadístico, y genera los gráficos.
-
-**Parámetros configurables:**
-*   `-K`: Cantidad de vectores candidatos de pesos a evaluar.
-*   `--n_runs`: Número de corridas de búsqueda consecutivas a promediar en el benchmark.
-*   `--search_seed`: Semilla aleatoria para la generación de candidatos Dirichlet.
-*   `--signal_strength` y `--data_seed`: Información de origen de datos para fines de auditoría del log.
-
-**Ejemplo de ejecución:**
-```bash
-python python/sequential.py -K 5000 --n_runs 5 --search_seed 42
-```
+👉 **[Consulta el MANUAL_USUARIO.md para instrucciones completas de uso, compilación, ejecución y automatización de benchmarks.](MANUAL_USUARIO.md)**
 
 ---
 
 ## Registro de Benchmarking y Visualizaciones
 
-### Registro en `results/benchmark.csv`
-Cada ejecución exitosa del pipeline de benchmark añade una fila al archivo CSV con las siguientes variables estadísticas:
-*   `implementation`: Nombre del runtime (`"sequential"` en Nivel 1, `"multicore"` en Nivel 2).
-*   `K`: Número de candidatos evaluados.
-*   `n_samples`: Cantidad de muestras procesadas.
-*   `n_items`: Dimensión de ítems metagenómicos.
-*   `n_runs`: Cantidad de corridas de timing.
-*   `mean_execution_time`: Tiempo medio neto del bucle de optimización (segundos).
-*   `std_execution_time`: Desviación estándar del tiempo de búsqueda (segundos).
-*   `best_auc`: Mayor AUC ROC alcanzado.
-*   `best_w1`, `best_w2`, `best_w3`: Pesos óptimos descubiertos.
-*   `signal_strength` / `seed`: Configuración experimental.
-*   `dtype`: Precisión de memoria utilizada (`"float32"`).
-*   `n_processes`: Número de procesos paralelos (solo en Nivel 2).
-*   `speedup`: Factor de aceleración en relación al baseline secuencial real.
-*   `efficiency`: Eficiencia paralela.
-*   `cpu_name` / `cpu_count` / `platform` / `python_version`: Metadatos del hardware y entorno de ejecución.
+Tanto la versión de Python (`multicore.py --sweep`) como las versiones en C (`run_sweep.py` y `run_sweep_mpi.py`) automatizan barridos sobre múltiples hilos ($P=1,2,4,8$) generando registros estadísticos detallados y automatizados en la carpeta `results/`:
 
-### Visualizaciones en `results/plots/`
-El ejecutor genera dos archivos gráficos de diagnóstico y tres de rendimiento HPC:
-1.  **`score_distribution.png`**: Histograma de las puntuaciones de muestras sanas (azul) vs. enfermas (naranja), mostrando el grado de separación logrado por el modelo optimizado.
-2.  **`roc_curve.png`**: Gráfico estándar ROC para el mejor candidato de pesos.
-3.  **`execution_time_vs_processes.png`**: Tiempo medio de ejecución en función del número de procesos CPU ($P$).
-4.  **`speedup_vs_processes.png`**: Aceleración observada en comparación con la aceleración ideal (lineal) y el ajuste de la Ley de Amdahl.
-5.  **`efficiency_vs_processes.png`**: Eficiencia paralela ($Speedup / P$) expresada como porcentaje.
-6.  **`amdahl_analysis.txt`**: Archivo de texto que detalla el análisis de escalabilidad, el valor de la fracción serial $f$, y los valores teóricos vs observados de speedup.
+*   **Tiempos y Eficiencia**: Tiempo medio (`mean_execution_time`), desviación estándar, factor de aceleración (`speedup`) y eficiencia paralela (`efficiency`) en relación al baseline.
+*   **Optimalidad**: Mejor AUC descubierto (`best_auc`) y los pesos W hallados (`best_w1`, etc).
+*   **Análisis Visual** *(Solo script Multicore de Python)*: Distribución de scores (`score_distribution.png`), Curva ROC (`roc_curve.png`), métricas de aceleración teórica vs real (`speedup_vs_processes.png`) y análisis automatizado de la Ley de Amdahl.
 
 ---
 
-## Nivel 2: Multiprocesamiento (Multicore)
+## Roadmap HPC (Futuro)
 
-La versión paralela distribuye los $K$ candidatos de pesos entre múltiples procesos CPU locales utilizando un `Pool` de procesos con el método `spawn`.
+Con las capas CPU Multicore y Multinodo completadas y validadas, el framework queda arquitectónicamente listo para la fase final:
 
-### 1. Optimización del IPC (Initializer Pattern)
-Para evitar serializar y enviar la matriz de abundancias $A$ y los perfiles de referencia metagenómica $T, S, F$ (que pueden ser gigantescos) a cada proceso en cada iteración:
-*   Se utiliza un inicializador de Pool (`_worker_init`) que inyecta estas variables de manera global en el contexto de memoria del proceso hijo al nacer.
-*   Posteriormente, cada worker procesa un bloque de candidatos (`chunk`) local, eliminando redundancias de comunicación (IPC Overhead).
-
-### 2. Instrucciones de Ejecución (Multicore)
-Usa el script `python/multicore.py` para correr la versión paralela:
-
-**Ejecución individual con un número fijo de cores ($P$):**
-```bash
-python python/multicore.py -K 5000 -P 4 --n_runs 5 --search_seed 42
-```
-
-**Ejecución automatizada de Barrido (Sweep):**
-Corre automáticamente para $P = 1, 2, 4, 8, \text{cpu\_count()}$, calcula métricas de escalabilidad, realiza el ajuste de la Ley de Amdahl, y genera los gráficos correspondientes en `results/plots/`:
-```bash
-python python/multicore.py -K 5000 --sweep --n_runs 5 --search_seed 42
-```
-
----
-
-## Preparación para la Escalabilidad Futura (Roadmap HPC)
-
-El código ha sido diseñado cuidadosamente para allanar el camino de las siguientes etapas de optimización:
-
-1.  **Multiprocessing (Nivel 2 - Python)**: 
-    *   La paralelización se realiza mapeando un pool de procesos (`multiprocessing.Pool`) sobre los $K$ candidatos, distribuyendo la carga computacional en múltiples núcleos de CPU.
-2.  **C/C++ con OpenMP (Nivel 3)**:
-    *   La operación central es el cálculo del vector $P$ y el producto matriz-vector $A \cdot P$. Un bucle paralelo `#pragma omp parallel for` acelerará drásticamente el producto matriz-vector para conjuntos masivos.
-3.  **MPI (Nivel 4 - Sistemas Distribuidos)**:
-    *   Para procesar millones de candidatos $K$ o dimensiones de ítems que no quepan en un solo nodo, MPI permitirá dividir el rango de candidatos o la matriz de datos entre múltiples nodos de cómputo.
-4.  **CUDA (Nivel 5 - Aceleración por GPU)**:
-    *   El uso de datos en precisión simple (`float32`) es el estándar óptimo para hardware GPU. El producto matriz-vector $A P$ y las sumas vectoriales pueden ejecutarse concurrentemente en miles de hilos de GPU usando librerías como PyCUDA, CuPy o implementando kernels CUDA directos para lograr aceleraciones masivas (superando los 100x en datasets gigantescos).
+1.  **CUDA (Nivel 5 - Aceleración Masiva por GPU)**:
+    *   El uso estricto y universal en el código de datos de precisión simple (`float32`) prepara el terreno de manera ideal para el hardware de GPU moderno. El producto matriz-vector $A P$ y las sumas vectoriales pueden ejecutarse concurrentemente en miles de hilos de GPU de manera matricial usando librerías como CuPy, PyCUDA o implementando kernels directos en C++ y CUDA (cublas) para lograr aceleraciones monstruosas (potencialmente superando factores de 100x respecto a la CPU secuencial en datasets gigantescos de cientos de miles de ítems).
